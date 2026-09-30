@@ -6,51 +6,71 @@ pipeline {
         ECS_CLUSTER        = 'guestbook'
         AWS_ROLE_ARN       = 'arn:aws:iam::004842028030:role/jenkins-ecs-operation'
         AWS_CRED_ID        = 'aws-ecs-jenkins'   // Username = Access Key ID, Password = Secret Access Key
+        SERVICE_FILE       = 'service.yml'       // danh sách service được phép thao tác
     }
 
-    parameters {
-        choice(
-            name: 'ACTION',
-            choices: [
-                'RESTART DEPLOYMENT',
-                '------------------------',
-                'EXPORT CONFIGURATION',
-                '------------------------',
-                'GET CURRENT POD NUMBERS',
-                'MULTI SCALING DOWN TO 0',
-                'MULTI SCALING FROM LIST',
-                'MULTI ADJUSTING HPA FROM LIST',
-                '------------------------',
-                'RELOAD'
-            ],
-            description: 'ACTION'
-        )
-        string(name: 'SELECTED_SERVICE', defaultValue: '', description: 'SELECTED SERVICE (dùng cho RESTART / EXPORT)')
-        text(name: 'SCALE_LIST', defaultValue: '', description: 'Mỗi dòng: service=desired (SCALING FROM LIST) hoặc service=min:max (HPA FROM LIST). Để trống với SCALING DOWN TO 0 = tất cả service')
-    }
+    // Không dùng block parameters {} vì dropdown SELECTED_SERVICE phải dựng từ service.yml.
+    // Parameters được tạo bằng properties() ở stage 'Load Services'; chọn ACTION = RELOAD sau khi sửa service.yml.
 
     stages {
-        stage('Validate') {
+        stage('Load Services') {
             steps {
                 script {
-                    if (params.ACTION.startsWith('---')) {
+                    SERVICES = loadServices(env.SERVICE_FILE)
+                    echo "Service trong ${env.SERVICE_FILE}: ${SERVICES}"
+                    properties([parameters([
+                        choice(
+                            name: 'ACTION',
+                            choices: [
+                                'RESTART DEPLOYMENT',
+                                '------------------------',
+                                'EXPORT CONFIGURATION',
+                                '------------------------',
+                                'GET CURRENT POD NUMBERS',
+                                'MULTI SCALING DOWN TO 0',
+                                'MULTI SCALING FROM LIST',
+                                'MULTI ADJUSTING HPA FROM LIST',
+                                '------------------------',
+                                'RELOAD'
+                            ],
+                            description: 'ACTION'
+                        ),
+                        choice(name: 'SELECTED_SERVICE', choices: SERVICES, description: "SELECTED SERVICE (lấy từ ${env.SERVICE_FILE}, dùng cho RESTART / EXPORT)"),
+                        text(name: 'SCALE_LIST', defaultValue: '', description: 'Mỗi dòng: service=desired (SCALING FROM LIST) hoặc service=min:max (HPA FROM LIST). Để trống với SCALING DOWN TO 0 = tất cả service')
+                    ])])
+                    // Lần chạy đầu (chưa có parameters) coi như RELOAD
+                    ACTION = params.ACTION ?: 'RELOAD'
+                    if (ACTION == 'RELOAD') echo 'Đã cập nhật parameters. Mở lại "Build with Parameters" để thấy dropdown mới.'
+                }
+            }
+        }
+
+        stage('Validate') {
+            when { expression { ACTION != 'RELOAD' } }
+            steps {
+                script {
+                    if (ACTION.startsWith('---')) {
                         error('Vui lòng chọn một ACTION hợp lệ, không chọn dòng phân cách.')
                     }
-                    if (params.ACTION in ['RESTART DEPLOYMENT', 'EXPORT CONFIGURATION'] && !params.SELECTED_SERVICE?.trim()) {
-                        error("ACTION '${params.ACTION}' cần nhập SELECTED_SERVICE.")
+                    // Dropdown có thể cũ hơn service.yml nếu chưa RELOAD
+                    if (ACTION in ['RESTART DEPLOYMENT', 'EXPORT CONFIGURATION'] && !(params.SELECTED_SERVICE in SERVICES)) {
+                        error("SELECTED_SERVICE '${params.SELECTED_SERVICE}' không có trong ${env.SERVICE_FILE}. Chạy RELOAD để cập nhật dropdown.")
                     }
-                    echo "ACTION: ${params.ACTION} | CLUSTER: ${env.ECS_CLUSTER} | SERVICE: ${params.SELECTED_SERVICE}"
+                    def unknown = []
+                    for (String s : parseList(params.SCALE_LIST).keySet()) { if (!(s in SERVICES)) unknown << s }
+                    if (unknown) error("SCALE_LIST có service không nằm trong ${env.SERVICE_FILE}: ${unknown}")
+                    echo "ACTION: ${ACTION} | CLUSTER: ${env.ECS_CLUSTER} | SERVICE: ${params.SELECTED_SERVICE}"
                 }
             }
         }
 
         stage('Execute') {
-            when { expression { params.ACTION != 'RELOAD' } }
+            when { expression { ACTION != 'RELOAD' } }
             steps {
                 script {
                     withAssumedRole {
                         powershell 'aws sts get-caller-identity'
-                        switch (params.ACTION) {
+                        switch (ACTION) {
                             case 'RESTART DEPLOYMENT':
                                 powershell """
                                     aws ecs update-service --cluster ${env.ECS_CLUSTER} --service ${params.SELECTED_SERVICE} --force-new-deployment --query 'service.deployments[0].status'
@@ -67,17 +87,11 @@ pipeline {
                                 archiveArtifacts artifacts: '*.json'
                                 break
                             case 'GET CURRENT POD NUMBERS':
-                                powershell """
-                                    \$svcs = (aws ecs list-services --cluster ${env.ECS_CLUSTER} --query 'serviceArns' --output text) -split '\\s+' | ? { \$_ }
-                                    aws ecs describe-services --cluster ${env.ECS_CLUSTER} --services \$svcs --query 'services[].[serviceName,desiredCount,runningCount,pendingCount]' --output table
-                                """
+                                powershell "aws ecs describe-services --cluster ${env.ECS_CLUSTER} --services ${SERVICES.join(' ')} --query 'services[].[serviceName,desiredCount,runningCount,pendingCount]' --output table"
                                 break
                             case 'MULTI SCALING DOWN TO 0':
                                 def targets = parseList(params.SCALE_LIST).keySet() as List
-                                if (!targets) {
-                                    targets = powershell(script: "aws ecs list-services --cluster ${env.ECS_CLUSTER} --query 'serviceArns[]' --output text", returnStdout: true)
-                                        .trim().split(/\s+/).collect { it.tokenize('/').last() }
-                                }
+                                if (!targets) targets = SERVICES
                                 input message: "Scale về 0 các service: ${targets}?", ok: 'Xác nhận'
                                 targets.each { svc ->
                                     powershell "aws ecs update-service --cluster ${env.ECS_CLUSTER} --service ${svc} --desired-count 0 --query 'service.desiredCount'"
@@ -117,6 +131,20 @@ def withAssumedRole(Closure body) {
     withEnv(["AWS_ACCESS_KEY_ID=${creds[0]}", "AWS_SECRET_ACCESS_KEY=${creds[1]}", "AWS_SESSION_TOKEN=${creds[2]}"]) {
         body()
     }
+}
+
+// Đọc list service từ YAML dạng "- name" (không cần plugin pipeline-utility-steps)
+def loadServices(String file) {
+    if (!fileExists(file)) error("Không tìm thấy ${file} trong repo.")
+    def result = []
+    for (String raw : readFile(file: file, encoding: 'UTF-8').readLines()) {
+        def line = raw.replaceAll(/#.*$/, '').trim()
+        if (!line.startsWith('-')) continue
+        def name = line.substring(1).trim().replaceAll(/^['"]|['"]$/, '')
+        if (name) result << name
+    }
+    if (!result) error("${file} không có service nào.")
+    return result
 }
 
 // "svc=value" mỗi dòng -> [svc: value]
