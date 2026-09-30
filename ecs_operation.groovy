@@ -90,8 +90,9 @@ pipeline {
                                 break
                             case 'MULTI ADJUSTING HPA FROM LIST':
                                 parseList(params.SCALE_LIST).each { svc, range ->
-                                    def (min, max) = range.tokenize(':')
-                                    powershell "aws application-autoscaling register-scalable-target --service-namespace ecs --scalable-dimension ecs:service:DesiredCount --resource-id service/${env.ECS_CLUSTER}/${svc} --min-capacity ${min} --max-capacity ${max}"
+                                    def mm = range.tokenize(':')
+                                    if (mm.size() != 2) error("HPA '${svc}' phải có dạng min:max, nhận được '${range}'")
+                                    powershell "aws application-autoscaling register-scalable-target --service-namespace ecs --scalable-dimension ecs:service:DesiredCount --resource-id service/${env.ECS_CLUSTER}/${svc} --min-capacity ${mm[0]} --max-capacity ${mm[1]}"
                                 }
                                 break
                         }
@@ -121,7 +122,9 @@ def withAssumedRole(Closure body) {
 // "svc=value" mỗi dòng -> [svc: value]
 def parseList(String text) {
     def result = [:]
-    (text ?: '').readLines()*.trim().findAll { it && !it.startsWith('#') }.each { line ->
+    for (String raw : (text ?: '').readLines()) {
+        def line = raw.trim()
+        if (!line || line.startsWith('#')) continue
         def parts = line.split('=', 2)
         if (parts.size() != 2) error("Dòng sai định dạng: '${line}'")
         result[parts[0].trim()] = parts[1].trim()
