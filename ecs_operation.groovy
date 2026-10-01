@@ -1,3 +1,8 @@
+import groovy.transform.Field
+
+@Field List SERVICES = []   // đọc từ service.yml ở stage 'Load Services'
+@Field String ACTION = ''
+
 pipeline {
     agent any
 
@@ -139,7 +144,7 @@ def loadServices(String file) {
     def result = []
     for (String raw : readFile(file: file, encoding: 'UTF-8').readLines()) {
         def line = raw.replaceAll(/#.*$/, '').trim()
-        if (!line.startsWith('-')) continue
+        if (!line.startsWith('- ')) continue   // bỏ qua '---' (đầu document YAML)
         def name = line.substring(1).trim().replaceAll(/^['"]|['"]$/, '')
         if (name) result << name
     }
